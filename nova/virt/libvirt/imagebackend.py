@@ -319,6 +319,16 @@ class Image(object):
         reason = _('direct_fetch() is not implemented')
         raise exception.ImageUnacceptable(image_id=image_id, reason=reason)
 
+    def direct_snapshot(self, snapshot_name, image_format, image_id):
+        """Prepare a snapshot for direct reference from glance
+
+        :raises: exception.ImageUnacceptable if it cannot be
+                 referenced directly in the specified image format
+        :returns: URL to be given to glance
+        """
+        reason = _('direct_snapshot() is not implemented')
+        raise exception.ImageUnacceptable(image_id=image_id, reason=reason)
+
 
 class Raw(Image):
     def __init__(self, instance=None, disk_name=None, path=None):
@@ -630,6 +640,32 @@ class Rbd(Image):
 
         reason = _('No image locations are accessible')
         raise exception.ImageUnacceptable(image_id=image_id, reason=reason)
+
+    def direct_snapshot(self, snapshot_name, image_format, image_id):
+        deletion_marker = '_to_be_deleted_by_glance'
+        if image_format != 'raw':
+            reason = _('only raw format is supported')
+            raise exception.ImageUnacceptable(image_id=image_id, reason=reason)
+        if not self.driver.supports_layering():
+            reason = _('librbd is too old')
+            raise exception.ImageUnacceptable(image_id=image_id, reason=reason)
+        rbd_snap_name = snapshot_name + deletion_marker
+        self.driver.create_snapshot(self.rbd_name, rbd_snap_name)
+        fsid = self.driver.get_fsid()
+        location = {'url' : 'rbd://{fsid}/{pool}/{image}/{snap}'.format(
+            fsid=fsid,
+            pool=self.pool,
+            image=self.rbd_name,
+            snap=rbd_snap_name)}
+        clone_name = self.rbd_name + '_clone_' + snapshot_name
+        clone_snap = 'snap'
+        self.driver.clone(location, clone_name)
+        self.driver.create_snapshot(clone_name, clone_snap)
+        return 'rbd://{fsid}/{pool}/{image}/{snap}'.format(
+            fsid=fsid,
+            pool=self.pool,
+            image=clone_name,
+            snap=clone_snap)
 
 
 class Backend(object):

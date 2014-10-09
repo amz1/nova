@@ -165,7 +165,7 @@ class RBDDriver(object):
             raise exception.ImageUnacceptable(image_id=url, reason=reason)
         return pieces
 
-    def _get_fsid(self):
+    def get_fsid(self):
         with RADOSClient(self) as client:
             return client.cluster.get_fsid()
 
@@ -177,7 +177,7 @@ class RBDDriver(object):
             LOG.debug(_('not cloneable: %s'), e)
             return False
 
-        if self._get_fsid() != fsid:
+        if self.get_fsid() != fsid:
             reason = _('%s is in a different ceph cluster') % url
             LOG.debug(reason)
             return False
@@ -210,6 +210,33 @@ class RBDDriver(object):
                                      dest_client.ioctx,
                                      dest_name,
                                      features=rbd.RBD_FEATURE_LAYERING)
+
+    def flatten(self, pool, name):
+        LOG.debug('flattening %(pool)s/%(img)s' %
+                  dict(pool=pool, img=name))
+        with RBDVolumeProxy(self, name, pool) as vol:
+            vol.flatten()
+
+    def create_snapshot(self, name, snap_name):
+        """Creates an rbd snapshot."""
+        with RBDVolumeProxy(self, name) as volume:
+            snap = snap_name.encode('utf-8')
+            volume.create_snap(snap)
+            if self.supports_layering():
+                volume.protect_snap(snap)
+
+    def delete_snapshot(self, name, snap_name):
+        """Deletes an rbd snapshot."""
+        # NOTE(dosaboy): this was broken by commit cbe1d5f. Ensure names are
+        #                utf-8 otherwise librbd will barf.
+        snap = snap_name.encode('utf-8')
+        with RBDVolumeProxy(self, name) as volume:
+            if self.supports_layering():
+                try:
+                    volume.unprotect_snap(snap)
+                except rbd.ImageBusy:
+                    raise exception.SnapshotIsBusy(snapshot_name=snap)
+            volume.remove_snap(snap)
 
     def size(self, name):
         with RBDVolumeProxy(self, name) as vol:
@@ -253,15 +280,22 @@ class RBDDriver(object):
     def cleanup_volumes(self, instance):
         with RADOSClient(self, self.pool) as client:
 
+            deletion_marker = '_to_be_deleted_by_glance'
+
             def belongs_to_instance(disk):
-                return disk.startswith(instance['uuid'])
+                return (disk.startswith(instance['uuid']) and
+                        deletion_marker not in disk and
+                        'clone' not in disk)
 
             # pylint: disable=E1101
             volumes = rbd.RBD().list(client.ioctx)
             for volume in filter(belongs_to_instance, volumes):
                 try:
                     rbd.RBD().remove(client.ioctx, volume)
-                except (rbd.ImageNotFound, rbd.ImageHasSnapshots):
+                except rbd.ImageHasSnapshots:
+                    new_name = volume + deletion_marker
+                    rbd.RBD().rename(client.ioctx, volume, new_name)
+                except rbd.ImageNotFound, rbd.ImageBusy:
                     LOG.warn(_('rbd remove %(volume)s in pool %(pool)s '
                                'failed'),
                              {'volume': volume, 'pool': self.pool})
